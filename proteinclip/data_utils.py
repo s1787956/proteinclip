@@ -12,7 +12,9 @@ from tqdm.auto import tqdm
 import h5py
 
 import torch
+import os
 from torch.utils.data import Dataset
+from glob import glob
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 assert DATA_DIR.exists(), f"Data directory {DATA_DIR} does not exist"
@@ -183,6 +185,105 @@ class CLIPDataset2D1D(Dataset):
 
         return {"x_1": embed1, "x_2": embed2}
 
+class CLIPDatasetPerceiver(Dataset):
+    """Dataset for CLIP.
+
+    Input can either be a list of pairs, where the first item corresponds to the
+    first map, and second item to the second map, or can be a list of single keys
+    that are present in both maps."""
+
+    def __init__(
+        self,
+        pairs: List[Tuple[Any, Any]] | List[Any],
+        map1: Mapping[Any, np.ndarray],
+        map2: Mapping[Any, np.ndarray],
+        enforce_unit_norm: bool = False,  # False for backwards compatibility
+        maxlen: int = 5795,
+    ):
+        self.pairs = pairs
+        self.map1 = map1
+        self.map2 = map2
+        self.maxlen = maxlen
+        # If specfied, unit norm all vectors before returning in __getitem__
+        self.enforce_unit_norm = enforce_unit_norm
+
+        # Trim out the pairs where either of the two members is either
+        # - not in the map
+        # - maps to a zero vector
+        # orig_len = len(self.pairs)
+        # self.pairs = []
+        # for item in tqdm(pairs, desc="Checking for missing/zero embeddings"):
+        #     if isinstance(item, (tuple, list)):
+        #         item1, item2 = item
+        #     else:
+        #         item1 = item
+        #         item2 = item
+        #     if np.allclose(self.map1.get(item1, 0), 0) or np.allclose(
+        #         self.map2.get(item2, 0), 0
+        #     ):
+        #         continue
+        #     self.pairs.append(item)
+
+        # logging.info(
+        #     f"Trimmed {orig_len - len(self.pairs)} pairs with missing/zero embeddings, {len(self.pairs)} remain."
+        # )
+
+    def unique_vectors_map1(
+        self, as_dict: bool = False
+    ) -> Dict[Any, np.ndarray] | np.ndarray:
+        """Get the unique vectors, return shape of (n, embed_dim)."""
+        # Gather all the vectors present in the map and covered by the "pairs"
+        if isinstance(next(iter(self.pairs)), (tuple, list)):
+            unique_keys = sorted(set([x for x, _ in self.pairs]))
+            if as_dict:
+                return {k: self.map1[k] for k in unique_keys}
+            return np.array([self.map1[k] for k in unique_keys])
+        # We don't have unique keys to rely on; instead use identity comparisons
+        # between vectors
+        if as_dict:
+            raise NotImplementedError("as_dict=True not implemented for this case")
+        keys = [
+            item[0] if isinstance(item, (tuple, list)) else item for item in self.pairs
+        ]
+        arr = np.array([self.map1[k] for k in keys])
+        return array_unique_rows(arr)
+
+    def unique_vectors_map2(
+        self, as_dict: bool = False
+    ) -> Dict[Any, np.ndarray] | np.ndarray:
+        """Get the unique vectors, return shape of (n, embed_dim)."""
+        if isinstance(next(iter(self.pairs)), (tuple, list)):
+            unique_keys = sorted(set([x for _, x in self.pairs]))
+            if as_dict:
+                return {k: self.map2[k] for k in unique_keys}
+            return np.array([self.map2[k] for k in unique_keys])
+        # Gather all the vectors present in the map and covered by the "pairs"
+        if as_dict:
+            raise NotImplementedError("as_dict=True not implemented for this case")
+        keys = [
+            item[1] if isinstance(item, (tuple, list)) else item for item in self.pairs
+        ]
+        arr = np.array([self.map2[k] for k in keys])
+        return array_unique_rows(arr)
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, index) -> Dict[str, np.ndarray]:
+        item = self.pairs[index]
+        if len(item) == 2:
+            item1, item2 = item
+        else:
+            item1 = item
+            item2 = item
+
+        embed1 = pad(np.array(h5py.File(self.map1[item1], "r")["features"][:]),self.maxlen).astype(np.float32)
+        embed2 = np.array(self.map2[item2]).astype(np.float32)
+        if self.enforce_unit_norm:
+            embed1 /= np.linalg.norm(embed1)
+            embed2 /= np.linalg.norm(embed2)
+
+        return {"x_1": embed1, "x_2": embed2}
 
 class LabeledPairDataset(Dataset):
     """Dataset of pairs of (a, b, label) with embeddings for a and b."""
@@ -237,11 +338,62 @@ class LabeledPairDataset(Dataset):
         )
 
 
+# def pad_or_sample(x: torch.Tensor, n: int, deterministic: bool) -> torch.Tensor:
+#     length = x.shape[0]
+#     if length <= n:
+#         # Too few features; pad with zeros
+#         pad_size = n - length
+#         padded = torch.cat([x, torch.zeros(pad_size, x.shape[1:][0])])
+#         return padded
+#     elif deterministic:
+#         # Sample equidistantly
+#         idx = torch.linspace(0, len(x) - 1, steps=n, dtype=torch.int)
+#         return x[idx]
+#     else:
+#         # Sample randomly
+#         idx = torch.randperm(length)[:n]
+#         return x[idx]
+
+def pad(x: np.ndarray, n: int) -> np.ndarray:
+    length = x.shape[0]
+    
+    # Too few features; pad with zeros
+    pad_size = n - length
+    padded = np.concatenate([x, np.zeros((pad_size, x.shape[1:][0]))])
+    assert padded.shape == (n,x.shape[-1]), padded.shape
+    return padded
+
+def create_prot_embedding_dict(h5_path,maxlen=5795):
+    #files = [os.path.join(h5_path,f) for f in os.listdir(h5_path) if f.endswith(".h5")]
+    order_file = h5py.File("../data/esm_36layer.hdf5", "r")
+    order_h5s = [key for key in order_file]
+    #assert len(files)==len(order_h5s), f"{len(files)=}!={len(order_h5s)=}"
+    
+    #TODO we need to load in the loader...
+    # pad(np.array(h5py.File(f, "r")["features"][:]),maxlen)
+    h5s = {idf:os.path.join(h5_path,f"{idf}.h5") for idf in order_h5s if os.path.exists(os.path.join(h5_path,f"{idf}.h5"))}
+    assert len(h5s.items()) == len(order_h5s), f"{len(h5s.items())=}!={len(order_h5s)=}"
+    logging.info(f"Loaded {len(h5s.items())} protein embeddings")
+    return h5s
+
+
 class MultiH5:
     def __init__(self, h5_files: List[str] | List[Path]):
         logging.info(f"Loading {len(h5_files)} h5 files: {h5_files}")
         self.h5_files = h5_files
+        # if len(self.h5_files)>1:
+        #     #TODO fix these horrible lines of code #FIXME
+        #     order_file = h5py.File("../data/esm_36layer.hdf5", "r")
+        #     order_h5s = [key for key in order_file]
+        #     assert len(np.unique(["".join(f.split('/')[:-1]) for f in h5_files]))==1
+        #     root_path = "".join(h5_files[0].split('/')[:-1])
+        #     self.h5s = [h5py.File(f, "r") for f in [os.path.join(root_path,f"{idf}.h5") for idf in order_h5s]]
+        #     assert len(self.h5s)>1 
+        #     #self.h5s = [self.h5s]
+        # else:            
         self.h5s = [h5py.File(f, "r") for f in h5_files]
+            # order has to be the same
+            
         self.mapping = ChainMap(*self.h5s)
 
     def __getitem__(self, key):

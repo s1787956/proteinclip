@@ -12,11 +12,12 @@ from typing import *
 from diskcache import FanoutCache
 
 import numpy as np
+import hdfdict
 
 from tqdm.auto import tqdm
 
-from proteinclip import gpt
-from proteinclip.fasta_utils import read_fasta, swissprot_identifier_human_only
+#from proteinclip import gpt
+#from proteinclip.fasta_utils import read_fasta, swissprot_identifier_human_only
 
 
 cache = FanoutCache(
@@ -268,36 +269,47 @@ def get_human_descriptions() -> Dict[str, str]:
     return retval
 
 
-def embed_function_descriptions(
-    dat_fname: str | Path,
-    human_only: bool = False,
-    model: gpt.GPT_EMBED_MODELS = "text-embedding-ada-002",
-    write_json: str = "",
-    **kwargs,
+def load_function_descriptions(
+    json_path: str | Path,
 ) -> Dict[str, np.ndarray]:
-    """Get embeddings corresponding to each human protein's function description
-
-    If write_json is specified, write the text and embeddings to a JSON file as
-    a "side-effect".
-    """
-    dat = SwissProtDataReader(dat_fname, **kwargs)
-    if human_only:
-        dat = {k: v for k, v in dat.items() if v["organism"] == "Homo sapiens (Human)"}
-    function_texts = {k: v["function"] for k, v in dat.items()}
-    embeddings = {
-        i: (gpt.get_openai_embedding(q, model=model) if q else np.zeros(1536))
-        for i, q in tqdm(function_texts.items(), desc=f"Embedding via {model}")
-    }
-
-    if write_json:
-        with open(write_json, "w") as sink:
-            obj = {
-                k: {"text": function_texts[k], "embedding": embeddings[k].tolist()}
-                for k in function_texts
-            }
-            json.dump(obj, sink, indent=2)
-
+    """Load extracted embeddings from JSON file """
+    print("Loading embeddings...")
+    res = hdfdict.load(json_path)
+    print("Creating dictionary...")
+    embeddings = dict(res)
     return embeddings
+    
+    
+# def embed_function_descriptions(
+#     dat_fname: str | Path,
+#     human_only: bool = False,
+#     model: gpt.GPT_EMBED_MODELS = "text-embedding-ada-002",
+#     write_json: str = "",
+#     **kwargs,
+# ) -> Dict[str, np.ndarray]:
+#     """Get embeddings corresponding to each human protein's function description
+
+#     If write_json is specified, write the text and embeddings to a JSON file as
+#     a "side-effect".
+#     """
+#     dat = SwissProtDataReader(dat_fname, **kwargs)
+#     if human_only:
+#         dat = {k: v for k, v in dat.items() if v["organism"] == "Homo sapiens (Human)"}
+#     function_texts = {k: v["function"] for k, v in dat.items()}
+#     embeddings = {
+#         i: (gpt.get_openai_embedding(q, model=model) if q else np.zeros(1536))       # 1536 not right for the large one
+#         for i, q in tqdm(function_texts.items(), desc=f"Embedding via {model}")
+#     }
+
+#     if write_json:
+#         with open(write_json, "w") as sink:
+#             obj = {
+#                 k: {"text": function_texts[k], "embedding": embeddings[k].tolist()}
+#                 for k in function_texts
+#             }
+#             json.dump(obj, sink, indent=2)
+
+#     return embeddings
 
 
 if __name__ == "__main__":

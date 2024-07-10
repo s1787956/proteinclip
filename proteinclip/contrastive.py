@@ -11,6 +11,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 import lightning.pytorch as pl
+import os
+#from os.path import exists
+from einops import rearrange, repeat
+from einops_exts import rearrange_many
+from torch import einsum, nn
 
 from proteinclip.attn import SingleTokenAttention
 
@@ -108,6 +113,132 @@ class MLPForRegression(MLP, pl.LightningModule):
         return opt
 
 
+def exists(val):
+    return val is not None
+
+def FeedForward(dim, mult=4):
+    inner_dim = int(dim * mult)
+    return nn.Sequential(
+        nn.LayerNorm(dim),
+        nn.Linear(dim, inner_dim, bias=False),
+        nn.GELU(),
+        nn.Linear(inner_dim, dim, bias=False),
+    )
+
+class PerceiverAttention(nn.Module):
+    def __init__(self, *, dim, dim_head=64, heads=8):
+        super().__init__()
+        self.scale = dim_head**-0.5
+        self.heads = heads
+        inner_dim = dim_head * heads
+
+        self.norm_media = nn.LayerNorm(dim)
+        self.norm_latents = nn.LayerNorm(dim)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def forward(self, x, latents):
+        """
+        Args:
+            x (torch.Tensor): image features
+                shape (b, T, n1, D)
+            latent (torch.Tensor): latent features
+                shape (b, T, n2, D)
+        """
+        x = self.norm_media(x)
+        latents = self.norm_latents(latents)
+
+        h = self.heads
+
+        q = self.to_q(latents)
+        kv_input = torch.cat((x, latents), dim=-2)
+        k, v = self.to_kv(kv_input).chunk(2, dim=-1)
+        q, k, v = rearrange_many((q, k, v), "b n (h d) -> b h n d", h=h)
+        q = q * self.scale
+
+        # attention
+        sim = einsum("... i d, ... j d  -> ... i j", q, k)
+        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
+        attn = sim.softmax(dim=-1)
+
+        out = einsum("... i j, ... j d -> ... i d", attn, v)
+        out = rearrange(out, "b h n d -> b n (h d)", h=h)
+        return self.to_out(out)
+
+class PerceiverResampler(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        depth=2,
+        dim_head=32,
+        num_latents=64, # adjust
+        max_num_media=None,
+        max_num_frames=None,
+        ff_mult=4,
+    ):
+        super().__init__()
+
+        heads = dim // dim_head
+        assert dim % dim_head == 0, "Number of heads must match ..."
+
+        self.latents = nn.Parameter(torch.randn(num_latents, dim))
+        self.frame_embs = (
+            nn.Parameter(torch.randn(max_num_frames, dim))
+            if exists(max_num_frames)
+            else None
+        )
+        self.media_time_embs = (
+            nn.Parameter(torch.randn(max_num_media, 1, dim))
+            if exists(max_num_media)
+            else None
+        )
+
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(
+                nn.ModuleList(
+                    [
+                        PerceiverAttention(dim=dim, dim_head=dim_head, heads=heads),
+                        FeedForward(dim=dim, mult=ff_mult),
+                    ]
+                )
+            )
+
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): image features
+                shape (b, T, F, v, D)
+        Returns:
+            shape (b, T, n, D) where n is self.num_latents
+        """
+        b, v, d = x.shape[:3]
+
+        # frame and media time embeddings
+        if exists(self.frame_embs):
+            frame_embs = repeat(self.frame_embs, "F d -> b T F v d", b=b, T=T, v=v)
+            x = x + frame_embs
+        # x = rearrange(
+        #     x, "b T F v d -> b T (F v) d"
+        # )  # flatten the frame and spatial dimensions
+        #if exists(self.media_time_embs):
+        #    x = x + self.media_time_embs[:T]
+
+        # blocks
+        latents = repeat(self.latents, "n d -> b n d", b=b)
+
+        for attn, ff in self.layers:         
+            latents = attn(x, latents) + latents
+            latents = ff(latents) + latents
+
+        out = self.norm(latents)
+        return out.mean(dim=1)
+
 class MLPForClassification(MLP, pl.LightningModule):
     def __init__(
         self,
@@ -156,6 +287,143 @@ class MLPForClassification(MLP, pl.LightningModule):
     def configure_optimizers(self) -> OptimizerLRScheduler:
         opt = torch.optim.AdamW(self.parameters(), lr=self.lr, eps=1e-10)
         return opt
+
+
+class ContrastiveEmbeddingPerceiver(pl.LightningModule):
+    """Module for taking embeddings and applying a contrastive loss."""
+
+    def __init__(
+        self,
+        input_dim_1: int,
+        input_dim_2: int,
+        shared_dim: int,
+        num_hidden: int = 1,
+        num_latents: int = 64,
+        hidden_dim: int = 1024,
+        lr: float = 1e-4,
+    ):
+        super().__init__()
+        self.input_dim_1 = input_dim_1
+        self.input_dim_2 = input_dim_2
+        self.hidden_dim = hidden_dim
+        self.shared_dim = shared_dim
+        self.lr = lr
+
+        # Project each input to the shared dim
+        # self.project_1 = nn.Sequential(nn.Linear(input_dim_1, shared_dim), UnitNorm())
+        # self.project_2 = nn.Sequential(nn.Linear(input_dim_2, shared_dim), UnitNorm())
+        self.project_1 = nn.Sequential(
+            nn.Linear(input_dim_1,hidden_dim),
+            PerceiverResampler(dim=hidden_dim,num_latents=num_latents),
+            #nn.AdaptiveAvgPool2d((1, input_dim_1)),
+            nn.Flatten(),
+            nn.Linear(hidden_dim,shared_dim),
+            nn.GELU(),
+            nn.Linear(shared_dim, shared_dim),
+        )
+        self.project_2 = MLP(
+            input_dim_2, [input_dim_2] * num_hidden + [shared_dim], unit_norm=True
+        )
+        self.t = nn.Parameter(data=torch.Tensor([1.0]), requires_grad=True)
+
+    def write_config_json(self, path: str) -> None:
+        """Write the configuration to a json file."""
+        with open(path, "w") as sink:
+            json.dump(
+                {
+                    "input_dim_1": self.input_dim_1,
+                    "input_dim_2": self.input_dim_2,
+                    "shared_dim": self.shared_dim,
+                    "lr": self.lr,
+                },
+                sink,
+                indent=4,
+            )
+
+    def forward(self, x_1: torch.Tensor, x_2: torch.Tensor) -> float:
+        """Project the two inputs into the shared embedding space and compute
+        the contrastive loss between them.
+        """
+        #print(f"{x_1.shape=}")
+        x1_proj = self.project_1(x_1)
+        #print(f"{x1_proj.shape=}")
+        x2_proj = self.project_2(x_2)
+        #print(f"{x2_proj.shape=}")
+        logits = x1_proj @ x2_proj.T * torch.exp(self.t.to(x1_proj.device))
+        labels = torch.arange(x1_proj.shape[0]).to(logits.device)
+        l_1 = F.cross_entropy(logits, labels)
+        l_2 = F.cross_entropy(logits.T, labels)
+        return (l_1 + l_2) / 2
+
+    def training_step(self, batch, batch_idx):
+        if isinstance(batch, tuple):
+            x_1, x_2 = batch
+        if isinstance(batch, dict):
+            x_1, x_2 = batch["x_1"], batch["x_2"]
+
+        loss = self.forward(x_1, x_2)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        if isinstance(batch, tuple):
+            x_1, x_2 = batch
+        if isinstance(batch, dict):
+            x_1, x_2 = batch["x_1"], batch["x_2"]
+
+        loss = self.forward(x_1, x_2)
+        self.log("val_loss", loss, prog_bar=True)
+
+    def configure_optimizers(self) -> OptimizerLRScheduler:
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, eps=1e-10)
+        return opt
+
+    def query(
+        self,
+        reference_set: Dict[Any, np.ndarray],
+        *,
+        query_1: np.ndarray | torch.Tensor | None = None,
+        query_2: np.ndarray | torch.Tensor | None = None,
+    ) -> List[Tuple[Any, float]]:
+        """Query the model with a set of reference embeddings and a query embedding."""
+        # depending on whether query1 or query2 is provided, project the other
+        # and compute the similarity
+        if query_1 is not None:
+            assert len(query_1.shape) == 1
+            if not isinstance(query_1, torch.Tensor):
+                query = torch.from_numpy(query_1).type(torch.float32)
+            else:
+                query = query_1
+
+            with torch.no_grad():
+                query_proj = self.project_1(query)
+                ref_proj = self.project_2(
+                    torch.tensor(
+                        np.array(list(reference_set.values())), dtype=torch.float32
+                    )
+                )
+        elif query_2 is not None:
+            assert len(query_2.shape) == 1
+            if not isinstance(query_2, torch.Tensor):
+                query = torch.from_numpy(query_2).type(torch.float32)
+            else:
+                query = query_2
+            with torch.no_grad():
+                query_proj = self.project_2(query)
+                ref_proj = self.project_1(
+                    torch.tensor(
+                        np.array(list(reference_set.values())), dtype=torch.float32
+                    )
+                )
+        else:
+            raise ValueError("Either query_1 or query_2 must be provided.")
+
+        # Compute similarities
+        sim = (query_proj @ ref_proj.T).cpu().numpy()
+        assert sim.size == len(reference_set), f"{sim.size} != {len(reference_set)}"
+        return sorted(
+            [(k, v) for k, v in zip(reference_set.keys(), sim)], key=lambda x: -x[1]
+        )
 
 
 class ContrastiveEmbedding(pl.LightningModule):

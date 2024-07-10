@@ -9,7 +9,8 @@ from torch.utils import data
 import lightning.pytorch as pl
 from lightning.pytorch.loggers.csv_logs import CSVLogger
 
-from proteinclip import data_utils, fasta_utils, swissprot, hparams
+from proteinclip import data_utils, hparams # fasta_utils, swissprot,
+from proteinclip.swissprot import load_function_descriptions
 from proteinclip import contrastive
 
 
@@ -60,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--pertoken",
         action="store_true",
         help="Embeddings are per-token, use aggregation.",
+    )
+    parser.add_argument(
+        "--perceiver",
+        action="store_true",
+        help="Perceiver for protein embeddings",
     )
     parser.add_argument(
         "--nhidden",
@@ -113,30 +119,41 @@ def main():
     logging.info(f"Hyperparameters: {hyperparameters}")
 
     # Load precomputed ESM2 embeddings
-    esm_embeddings = data_utils.MultiH5(args.protein_embed)
-
+    if args.perceiver:
+        esm_embeddings = data_utils.create_prot_embedding_dict(args.protein_embed[0])
+    else:
+        esm_embeddings = data_utils.MultiH5(args.protein_embed)
+    
     # Load in the precomputed GPT text embeddings
-    sp_text_embed = swissprot.embed_function_descriptions(args.dat, model=args.gpt)
-
+    #sp_text_embed = swissprot.embed_function_descriptions(args.dat, model=args.gpt)
+    sp_text_embed = load_function_descriptions(args.dat)
     # Identify shared keys
     shared_keys = sorted(set(esm_embeddings.keys()).intersection(sp_text_embed.keys()))
 
-    # Create dataset; first item is ESM, second is text
-    if args.pertoken:
-        dset = data_utils.CLIPDataset2D1D(
-            pairs=shared_keys, map1=esm_embeddings, map2=sp_text_embed
-        )
-    else:
-        dset = data_utils.CLIPDataset(
+    # Create dataset; first item is ESM, second is text 
+    if args.perceiver:
+        dset = data_utils.CLIPDatasetPerceiver(
             pairs=shared_keys,
             map1=esm_embeddings,
             map2=sp_text_embed,
             enforce_unit_norm=args.unitnorm,
         )
+    else:
+        if args.pertoken:
+            dset = data_utils.CLIPDataset2D1D(
+                pairs=shared_keys, map1=esm_embeddings, map2=sp_text_embed
+            )
+        else:
+            dset = data_utils.CLIPDataset(
+                pairs=shared_keys,
+                map1=esm_embeddings,
+                map2=sp_text_embed,
+                enforce_unit_norm=args.unitnorm,
+            )
 
     # Create data splits
     if not args.splitfile:
-        split_indices = data_utils.random_split(len(dset), [0.9, 0.05, 0.05])
+        split_indices = data_utils.random_split(len(dset), [0.95, 0.05, 0.05])
         logging.info(f"Randomized split sizes: {[len(x) for x in split_indices]}")
     else:
         assert os.path.isfile(args.splitfile)
@@ -170,20 +187,27 @@ def main():
             batch_size=hyperparameters.batch_size,
             shuffle=(i == 0),
             # drop_last=(i == 0),
-            num_workers=8,
+            num_workers=0,
             pin_memory=True,
         )
         for i, ds in enumerate(dset_splits)
     ]
 
     # Definte network
-    input_dim_1 = next(iter(train_dl))["x_1"].shape[-1]
-    input_dim_2 = next(iter(train_dl))["x_2"].shape[-1]
-    model_class = (
-        contrastive.ContrastiveEmbeddingWithPreprocessor
-        if args.pertoken
-        else contrastive.ContrastiveEmbedding
-    )
+    input_1_shape = next(iter(train_dl))["x_1"].shape
+    input_2_shape = next(iter(train_dl))["x_2"].shape
+    print(f"{input_1_shape=}")
+    print(f"{input_2_shape=}")
+    input_dim_1 = input_1_shape[-1]
+    input_dim_2 = input_2_shape[-1]
+    if args.perceiver:
+        model_class = contrastive.ContrastiveEmbeddingPerceiver
+    else:
+        model_class = (
+            contrastive.ContrastiveEmbeddingWithPreprocessor
+            if args.pertoken
+            else contrastive.ContrastiveEmbedding
+        )
     net = model_class(
         input_dim_1=input_dim_1,
         input_dim_2=input_dim_2,
